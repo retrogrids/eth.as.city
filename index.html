@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Ethereum Address Space — Isometric City</title>
+<!--
+  Ethereum Address Space, rendered as an isometric city.
+
+  Encoding
+  --------
+  An address is 160 bits. It's split into an x-half (bits 0..79) and a
+  y-half (bits 80..159). At a resolution of k bits, each coordinate is the
+  top k bits (the k-bit prefix) of its half, so the grid is 2^k x 2^k.
+  The "uniqueness resolution" K* is the smallest k at which every
+  (x-prefix, y-prefix) pair is distinct — the finest square where each
+  address gets its own tile. Below K*, several addresses can share a tile
+  and are aggregated into one building.
+
+  Height = log10(1 + total transactions in the tile).
+  Color  = category / type / balance (toggle).
+
+  Data
+  ----
+  This build ships with a statistically realistic *synthetic* rich list
+  (power-law balances, contract/EOA mix, activity-correlated tx counts).
+  Live chain data isn't fetched here. Drop in real data with "Load JSON":
+  an array of { address, type, balance, txCount, label?, category? }.
+  See loadRecords() for the exact schema. Sources for real top-holder data
+  include Etherscan Pro (topaddresses), Dune, Bitquery, or the public
+  bigquery-public-data.crypto_ethereum dataset.
+
+  Requires WebGL + a network connection for Three.js (loaded from cdnjs).
+-->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  :root{
+    --bg-0:#05050f;
+    --bg-1:#0b0a24;
+    --ink:#cfe3ff;
+    --ink-dim:#8ea6cf;
+    --line:rgba(94,132,224,.45);
+    --cyan:#00e5ff;
+    --magenta:#ff2d95;
+    --purple:#b14bff;
+    --green:#39ff14;
+    --amber:#ffd23f;
+    --orange:#ff7b29;
+    --panel:rgba(9,10,30,.78);
+    --panel-brd:rgba(0,229,255,.35);
+    --glow:0 0 22px rgba(0,229,255,.14), inset 0 0 0 1px rgba(0,229,255,.06);
+    --mono:'SFMono-Regular', ui-monospace, 'JetBrains Mono', Menlo, Consolas, 'Courier New', monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--bg-0);overflow:hidden;color:var(--ink);
+    font-family:var(--mono);-webkit-font-smoothing:antialiased}
+  /* Vaporwave backdrop behind the transparent canvas */
+  #bg{position:fixed;inset:0;z-index:0;
+    background:
+      radial-gradient(120% 80% at 50% 118%, rgba(255,45,149,.20), transparent 55%),
+      radial-gradient(100% 70% at 12% -10%, rgba(0,229,255,.14), transparent 50%),
+      radial-gradient(90% 60% at 92% 4%, rgba(177,75,255,.12), transparent 55%),
+      linear-gradient(180deg, var(--bg-1) 0%, var(--bg-0) 68%);}
+  #scene{position:fixed;inset:0;z-index:1}
+  #scene canvas{display:block;touch-action:none}
+
+  /* CRT overlays */
+  #scanlines{position:fixed;inset:0;z-index:5;pointer-events:none;mix-blend-mode:overlay;opacity:.5;
+    background:repeating-linear-gradient(0deg, rgba(0,0,0,0) 0 2px, rgba(0,0,0,.55) 2px 3px);}
+  #scanlines.off{display:none}
+  #vignette{position:fixed;inset:0;z-index:6;pointer-events:none;
+    background:radial-gradient(120% 100% at 50% 40%, transparent 55%, rgba(0,0,10,.55) 100%);}
+
+  .panel{position:fixed;z-index:10;background:var(--panel);border:1px solid var(--panel-brd);
+    border-radius:10px;backdrop-filter:blur(9px);-webkit-backdrop-filter:blur(9px);
+    box-shadow:var(--glow);padding:14px 15px;font-size:12px;line-height:1.5}
+  .panel h1,.panel h2{margin:0;font-weight:700}
+
+  /* Title / stats */
+  #hud{top:16px;left:16px;max-width:330px}
+  #hud h1{font-size:15px;letter-spacing:.14em;text-transform:uppercase;
+    color:#fff;text-shadow:0 0 12px rgba(0,229,255,.55), 0 0 3px rgba(0,229,255,.9)}
+  #hud .sub{margin-top:3px;color:var(--ink-dim);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase}
+  #hud .src{display:inline-block;margin-top:6px;padding:2px 7px;border-radius:999px;font-size:9.5px;
+    letter-spacing:.14em;text-transform:uppercase;border:1px solid rgba(255,210,63,.5);color:var(--amber);
+    background:rgba(255,210,63,.07)}
+  #hud .src.live{border-color:rgba(57,255,20,.5);color:var(--green);background:rgba(57,255,20,.07)}
+  .stat-grid{margin-top:12px;display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font-size:12px}
+  .stat-grid .k{color:var(--ink-dim)}
+  .stat-grid .v{text-align:right;color:var(--ink);font-variant-numeric:tabular-nums}
+  .stat-grid .v b{color:var(--cyan)}
+  .rule{height:1px;margin:11px -2px;background:linear-gradient(90deg,transparent,var(--line),transparent)}
+  .uniq{font-size:11px;color:var(--ink-dim)}
+  .uniq b{color:var(--amber)}
+
+  /* Controls */
+  #controls{top:16px;right:16px;width:252px;display:flex;flex-direction:column;gap:12px}
+  #controls .lbl{display:flex;justify-content:space-between;align-items:baseline;
+    font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-dim)}
+  #controls .lbl b{color:var(--cyan);font-size:11px;letter-spacing:0}
+  input[type=range]{width:100%;accent-color:var(--cyan);height:22px;cursor:pointer;margin:2px 0 0}
+  .res-meta{margin-top:2px;font-size:10.5px;color:var(--ink-dim);font-variant-numeric:tabular-nums}
+  .seg{display:flex;border:1px solid var(--panel-brd);border-radius:8px;overflow:hidden}
+  .seg button{flex:1;appearance:none;border:0;background:transparent;color:var(--ink-dim);
+    font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+    padding:7px 0;cursor:pointer;border-right:1px solid var(--panel-brd)}
+  .seg button:last-child{border-right:0}
+  .seg button.on{background:rgba(0,229,255,.16);color:#eaffff;text-shadow:0 0 8px rgba(0,229,255,.6)}
+  .btnrow{display:flex;gap:8px;flex-wrap:wrap}
+  .btn{appearance:none;flex:1;min-width:0;background:rgba(0,229,255,.05);color:var(--ink);
+    border:1px solid var(--panel-brd);border-radius:8px;padding:8px 6px;font-family:var(--mono);
+    font-size:11px;letter-spacing:.06em;cursor:pointer;transition:background .12s,box-shadow .12s;white-space:nowrap}
+  .btn:hover{background:rgba(0,229,255,.15);box-shadow:0 0 14px rgba(0,229,255,.2)}
+  .btn:active{transform:translateY(1px)}
+  .btn.sm{flex:0 0 auto;padding:8px 11px}
+  :focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+
+  /* Legend */
+  #legend{left:16px;bottom:16px;max-width:230px}
+  #legend .cap{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-dim);margin-bottom:9px}
+  .leg-item{display:flex;align-items:center;gap:9px;margin:5px 0;font-size:11.5px}
+  .sw{width:13px;height:13px;border-radius:3px;flex:0 0 auto;box-shadow:0 0 8px currentColor}
+  .grad{height:11px;border-radius:4px;margin:4px 0 6px;
+    background:linear-gradient(90deg,hsl(200,75%,42%),hsl(268,88%,52%),hsl(330,100%,62%))}
+  .grad-lbl{display:flex;justify-content:space-between;font-size:10px;color:var(--ink-dim)}
+
+  /* Hint */
+  #hint{left:50%;bottom:14px;transform:translateX(-50%);z-index:10;font-size:10.5px;
+    letter-spacing:.1em;color:var(--ink-dim);text-transform:uppercase;
+    background:rgba(9,10,30,.5);padding:6px 12px;border-radius:999px;border:1px solid rgba(94,132,224,.2);
+    pointer-events:none;transition:opacity .6s}
+
+  /* Hover / pinned card */
+  #hover{position:fixed;z-index:20;min-width:236px;max-width:300px;background:var(--panel);
+    border:1px solid var(--panel-brd);border-radius:10px;padding:12px 13px;font-size:12px;
+    box-shadow:0 0 26px rgba(0,229,255,.2), inset 0 0 0 1px rgba(0,229,255,.06);
+    backdrop-filter:blur(9px);-webkit-backdrop-filter:blur(9px);pointer-events:none;
+    opacity:0;transition:opacity .09s}
+  #hover.show{opacity:1}
+  #hover.pinned{pointer-events:auto;border-color:rgba(255,210,63,.55);
+    box-shadow:0 0 26px rgba(255,210,63,.2), inset 0 0 0 1px rgba(255,210,63,.08)}
+  #hover .htop{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}
+  #hover .badge{font-size:9px;letter-spacing:.14em;text-transform:uppercase;padding:2px 7px;border-radius:999px}
+  #hover .title{font-weight:700;font-size:12.5px;color:#fff}
+  #hover .rows{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin-top:2px}
+  #hover .rk{color:var(--ink-dim)}
+  #hover .rv{text-align:right;font-variant-numeric:tabular-nums}
+  #hover .rv.big{color:var(--cyan);font-weight:700}
+  #hover .addr{margin-top:9px;padding-top:9px;border-top:1px solid rgba(94,132,224,.25);
+    font-size:10.5px;color:var(--ink-dim);word-break:break-all}
+  #hover .addr b{color:var(--ink)}
+  #hover .merged{margin-top:9px;font-size:10.5px;color:var(--amber);
+    background:rgba(255,210,63,.08);border-radius:6px;padding:6px 8px}
+  #hover .pinbar{display:flex;justify-content:space-between;align-items:center;margin-top:9px;
+    padding-top:8px;border-top:1px solid rgba(255,210,63,.25)}
+  #hover .pin-x{cursor:pointer;color:var(--ink-dim);font-size:14px;line-height:1}
+  #hover .copy{cursor:pointer;font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--cyan);border:1px solid var(--panel-brd);border-radius:6px;padding:3px 8px;background:transparent}
+
+  /* Splash */
+  #splash{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;
+    flex-direction:column;gap:14px;background:var(--bg-0);transition:opacity .5s}
+  #splash.gone{opacity:0;pointer-events:none}
+  #splash .big{font-size:16px;letter-spacing:.28em;text-transform:uppercase;color:#fff;
+    text-shadow:0 0 16px rgba(0,229,255,.6)}
+  #splash .sm{font-size:11px;letter-spacing:.14em;color:var(--ink-dim);text-transform:uppercase}
+  .spin{width:26px;height:26px;border:2px solid rgba(0,229,255,.2);border-top-color:var(--cyan);
+    border-radius:50%;animation:sp 1s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+
+  #drop{position:fixed;inset:0;z-index:45;display:none;align-items:center;justify-content:center;
+    background:rgba(5,5,20,.8);border:3px dashed var(--cyan);color:#fff;font-size:15px;letter-spacing:.2em;
+    text-transform:uppercase}
+  #drop.on{display:flex}
+
+  @media (max-width:720px){
+    #hud{max-width:none;left:10px;right:10px;top:10px}
+    #controls{right:10px;left:10px;top:auto;bottom:74px;width:auto}
+    #legend{display:none}
+    #hint{display:none}
+  }
+  @media (prefers-reduced-motion: reduce){ .spin{animation:none} }
+</style>
+</head>
+<body>
+  <div id="bg"></div>
+  <div id="scene"></div>
+  <div id="scanlines"></div>
+  <div id="vignette"></div>
+
+  <div id="hud" class="panel">
+    <h1>Ethereum Address Space</h1>
+    <div class="sub">Isometric map of the top addresses</div>
+    <div><span class="src" id="srcTag">Synthetic dataset</span></div>
+    <div class="stat-grid" id="statGrid"></div>
+    <div class="rule"></div>
+    <div class="uniq" id="uniqLine"></div>
+  </div>
+
+  <div id="controls" class="panel">
+    <div>
+      <div class="lbl">Grid resolution <b id="kBadge">k=7</b></div>
+      <input type="range" id="kSlider" min="5" max="15" step="1" value="7" />
+      <div class="res-meta" id="resMeta"></div>
+    </div>
+    <div>
+      <div class="lbl" style="margin-bottom:5px">Color by</div>
+      <div class="seg" id="colorSeg">
+        <button data-mode="category" class="on">Category</button>
+        <button data-mode="type">Type</button>
+        <button data-mode="balance">Balance</button>
+      </div>
+    </div>
+    <div class="btnrow">
+      <button class="btn sm" id="rotL" title="Rotate view left">⟲</button>
+      <button class="btn sm" id="rotR" title="Rotate view right">⟳</button>
+      <button class="btn" id="resetBtn">Reset view</button>
+    </div>
+    <div class="btnrow">
+      <button class="btn" id="loadBtn">Load JSON</button>
+      <button class="btn" id="scanBtn">CRT: on</button>
+    </div>
+    <input type="file" id="fileIn" accept="application/json,.json" style="display:none" />
+  </div>
+
+  <div id="legend" class="panel">
+    <div class="cap" id="legendCap">Category</div>
+    <div id="legendBody"></div>
+  </div>
+
+  <div id="hint">Drag to pan · Scroll to zoom · Hover a building · Click to pin</div>
+
+  <div id="hover"></div>
+
+  <div id="drop">Drop JSON to load</div>
+
+  <div id="splash">
+    <div class="spin"></div>
+    <div class="big">Building the city</div>
+    <div class="sm" id="splashSub">Generating address space…</div>
+  </div>
+
+<script>
+"use strict";
+(function(){
+  const HAS_THREE = typeof THREE !== "undefined";
+  const splashSub = document.getElementById("splashSub");
+  if(!HAS_THREE){
+    splashSub.textContent = "Three.js failed to load — check your connection";
+    return;
+  }
+
+  /* ---------------------------------------------------------------- config */
+  const CFG = {
+    N: 10000,
+    seed: 0x1337BEEF,
+    footprint: 0.86,     // building footprint within a 1x1 tile
+    hMin: 0.5, hMax: 16, // building height range (world units)
+    kMinFloor: 5,
+    isoElev: Math.atan(1/Math.SQRT2),   // true isometric elevation (~35.264°)
+    az0: Math.PI * 0.25,
+  };
+  const CAT = {
+    exchange:{hex:0xff2d95, css:"#ff2d95", label:"Exchange",  contract:true},
+    defi:    {hex:0x00e5ff, css:"#00e5ff", label:"DeFi / DEX", contract:true},
+    bridge:  {hex:0xb14bff, css:"#b14bff", label:"Bridge",     contract:true},
+    staking: {hex:0x39ff14, css:"#39ff14", label:"Staking",    contract:true},
+    token:   {hex:0xffd23f, css:"#ffd23f", label:"Token",      contract:true},
+    personal:{hex:0xff7b29, css:"#ff7b29", label:"Personal (EOA)", contract:false},
+  };
+  const TYPE_COLOR = { contract:0x00e5ff, eoa:0xff2d95 };
+  const prefersReduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ---------------------------------------------------------- deterministic RNG */
+  function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);
+    t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+
+  /* ------------------------------------------------- synthetic rich-list data */
+  function generateData(){
+    const R = mulberry32(CFG.seed);
+    const HEX = "0123456789abcdef";
+    const randHex = n => { let s=""; for(let i=0;i<n;i++) s+=HEX[(R()*16)|0]; return s; };
+    const lognorm = (mu,sig)=>{ let u=0,v=0; while(!u)u=R(); while(!v)v=R();
+      const z=Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); return Math.exp(mu+sig*z); };
+    const cats = [["personal",.35],["token",.24],["defi",.18],["exchange",.12],["bridge",.08],["staking",.03]];
+    const pickCat = ()=>{ let r=R(),acc=0; for(const[c,w]of cats){acc+=w; if(r<=acc)return c;} return "personal"; };
+    const txr = {exchange:[4,7], defi:[3,6.3], bridge:[3,6], token:[2,5.5], staking:[1.5,4.5], personal:[0,3.7]};
+    const recs = [];
+    for(let i=0;i<CFG.N;i++){
+      const cat = pickCat();
+      const type = CAT[cat].contract ? "contract" : "eoa";
+      const balance = 1000 * Math.pow((i+1)/CFG.N, -0.9) * lognorm(0,0.45);
+      const [lo,hi] = txr[cat];
+      const txCount = Math.max(1, Math.round(Math.pow(10, lo+(hi-lo)*R()) * lognorm(0,0.15)));
+      recs.push(makeRecord("0x"+randHex(40), type, balance, txCount, null, cat));
+    }
+    return recs;
+  }
+
+  function makeRecord(address, type, balance, txCount, label, category){
+    const hex = address.replace(/^0x/i,"").toLowerCase().padStart(40,"0").slice(-40);
+    return {
+      address: "0x"+hex, type, balance:+balance, txCount:+txCount,
+      label: label||null, category: category || (type==="contract"?"token":"personal"),
+      x: BigInt("0x"+hex.slice(0,20)),   // bits 0..79
+      y: BigInt("0x"+hex.slice(20,40)),  // bits 80..159
+    };
+  }
+
+  /* ------------------------------------------------------------- encoding */
+  const px = (v,k)=> Number(v >> BigInt(80-k));   // top k bits of an 80-bit half
+
+  function computeUniqueK(recs){
+    for(let k=1;k<=40;k++){
+      const seen = new Set(); let ok = true;
+      for(const r of recs){ const key = px(r.x,k)+"_"+px(r.y,k);
+        if(seen.has(key)){ ok=false; break; } seen.add(key); }
+      if(ok) return k;
+    }
+    return 40;
+  }
+  function axisUniqueBits(recs, which){
+    for(let b=1;b<=80;b++){
+      const seen = new Set(); let ok = true;
+      for(const r of recs){ const v = px(which==="x"?r.x:r.y, b);
+        if(seen.has(v)){ ok=false; break; } seen.add(v); }
+      if(ok) return b;
+    }
+    return 80;
+  }
+  function occupiedAt(recs,k){
+    const s = new Set(); for(const r of recs) s.add(px(r.x,k)+"_"+px(r.y,k)); return s.size;
+  }
+
+  /* ------------------------------------------------------------- app state */
+  let records = [];
+  let uniqueK = 15, xBits = 27, yBits = 26;
+  let kMin = 5, kMax = 15, k = 7;
+  let cells = [];              // one entry per occupied tile
+  let gridW = 128, gridH = 128;
+  let colorMode = "category";
+  let balLogMin = 0, balLogMax = 1;
+  let dataSynthetic = true;
+
+  /* ------------------------------------------------------------- three.js */
+  const container = document.getElementById("scene");
+  const renderer = new THREE.WebGLRenderer({antialias:true, alpha:true});
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio||1, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setClearColor(0x000000, 0);
+  container.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.OrthographicCamera(-100,100,100,-100,0.1,5000);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  scene.add(new THREE.HemisphereLight(0x8ea0ff, 0x241033, 0.35));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.75);
+  dir.position.set(60, 120, 38);
+  scene.add(dir);
+
+  // Ground with a tiled grid texture (one tile == one cell, any resolution)
+  const gtex = (function(){
+    const s = 128, c = document.createElement("canvas"); c.width=c.height=s;
+    const g = c.getContext("2d");
+    g.fillStyle = "#08081a"; g.fillRect(0,0,s,s);
+    g.fillStyle = "rgba(86,116,214,0.55)";
+    g.fillRect(0,0,s,5); g.fillRect(0,0,5,s);            // top + left edge -> grid lines when tiled
+    g.fillStyle = "rgba(0,229,255,0.10)";
+    g.fillRect(0,0,s,2); g.fillRect(0,0,2,s);            // faint neon core
+    const t = new THREE.CanvasTexture(c);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.magFilter = THREE.NearestFilter; t.minFilter = THREE.LinearMipmapLinearFilter;
+    t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    return t;
+  })();
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(1,1),
+    new THREE.MeshBasicMaterial({map:gtex})
+  );
+  ground.rotation.x = -Math.PI/2;
+  ground.position.y = -0.02;
+  scene.add(ground);
+
+  // Buildings: a single InstancedMesh (capacity N)
+  const boxGeo = new THREE.BoxGeometry(1,1,1);
+  const boxMat = new THREE.MeshLambertMaterial({color:0xffffff});
+  const buildings = new THREE.InstancedMesh(boxGeo, boxMat, CFG.N);
+  buildings.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  buildings.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(CFG.N*3).fill(1), 3);
+  buildings.instanceColor.setUsage(THREE.DynamicDrawUsage);
+  buildings.frustumCulled = false;
+  buildings.count = 0;
+  scene.add(buildings);
+  const dummy = new THREE.Object3D();
+  const tmpColor = new THREE.Color();
+
+  // Hover highlight outline
+  const highlight = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(1,1,1)),
+    new THREE.LineBasicMaterial({color:0xffffff, transparent:true, opacity:0.95})
+  );
+  highlight.visible = false; highlight.renderOrder = 2;
+  scene.add(highlight);
+
+  /* -------------------------------------------------- camera control state */
+  const control = {
+    target: new THREE.Vector3(0,0,0),
+    az: CFG.az0, azTarget: CFG.az0,
+    zoom: 1,
+    baseHalf: 100, dist: 400,
+  };
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+
+  function worldPos(cx, cz){
+    return { x: cx - gridW/2 + 0.5, z: cz - gridH/2 + 0.5 };
+  }
+
+  function colorForCell(cell){
+    const rep = records[cell.repIdx];
+    if(colorMode === "type") return tmpColor.setHex(TYPE_COLOR[rep.type] || 0xffffff);
+    if(colorMode === "balance"){
+      const t = balLogMax>balLogMin
+        ? (Math.log10(1+rep.balance)-balLogMin)/(balLogMax-balLogMin) : 0.5;
+      const tt = Math.min(1,Math.max(0,t));
+      const h = (200 + 130*tt)/360, s = 0.75 + 0.25*tt, l = 0.42 + 0.20*tt;
+      return tmpColor.setHSL(h,s,l);
+    }
+    return tmpColor.setHex((CAT[rep.category]||CAT.personal).hex);
+  }
+
+  /* ----------------------------------------------------- build / rebuild city */
+  function buildCity(newK){
+    k = newK;
+    gridW = gridH = Math.pow(2, k);
+
+    // aggregate addresses into tiles
+    const map = new Map();
+    for(let i=0;i<records.length;i++){
+      const r = records[i];
+      const cx = px(r.x,k), cz = px(r.y,k);
+      const key = cx+"_"+cz;
+      let cell = map.get(key);
+      if(!cell){ cell = {cx,cz, idx:[i], sumTx:r.txCount, sumBal:r.balance, repIdx:i};
+        map.set(key,cell); }
+      else{ cell.idx.push(i); cell.sumTx += r.txCount; cell.sumBal += r.balance;
+        if(r.balance > records[cell.repIdx].balance) cell.repIdx = i; }
+    }
+    cells = Array.from(map.values());
+
+    // height range from this resolution's tile tx-sums (keeps a good spread at every k)
+    let lMin = Infinity, lMax = -Infinity;
+    for(const c of cells){ const L = Math.log10(1+c.sumTx); c._L=L;
+      if(L<lMin)lMin=L; if(L>lMax)lMax=L; }
+    const span = lMax-lMin;
+    const FOOT = CFG.footprint;
+    for(let i=0;i<cells.length;i++){
+      const c = cells[i];
+      const h = span>1e-9 ? CFG.hMin + (CFG.hMax-CFG.hMin)*((c._L-lMin)/span) : (CFG.hMin+CFG.hMax)/2;
+      c.height = h;
+      const p = worldPos(c.cx, c.cz);
+      dummy.position.set(p.x, h/2, p.z);
+      dummy.scale.set(FOOT, h, FOOT);
+      dummy.rotation.set(0,0,0);
+      dummy.updateMatrix();
+      buildings.setMatrixAt(i, dummy.matrix);
+      buildings.setColorAt(i, colorForCell(c));
+    }
+    buildings.count = cells.length;
+    buildings.instanceMatrix.needsUpdate = true;
+    buildings.instanceColor.needsUpdate = true;
+
+    // ground sizing
+    ground.scale.set(gridW, gridH, 1);
+    gtex.repeat.set(gridW, gridH);
+    gtex.needsUpdate = true;
+
+    clearSelection();
+    updateStats();
+    updateResMeta();
+  }
+
+  function recolor(){
+    for(let i=0;i<cells.length;i++) buildings.setColorAt(i, colorForCell(cells[i]));
+    buildings.instanceColor.needsUpdate = true;
+  }
+
+  /* ------------------------------------------------------- camera framing */
+  function fitCamera(resetRotation){
+    const r = 0.5*Math.sqrt(gridW*gridW + gridH*gridH) + CFG.hMax;
+    control.baseHalf = r * 1.06;
+    control.dist = r * 3;
+    control.target.set(0, CFG.hMax*0.15, 0);
+    control.zoom = 1;
+    if(resetRotation) control.azTarget = CFG.az0;
+    camera.near = 0.1;
+    camera.far = control.dist + r*4;
+    updateFrustum();
+  }
+  function updateFrustum(){
+    const aspect = window.innerWidth/window.innerHeight;
+    const hH = control.baseHalf, hW = hH*aspect;
+    camera.left=-hW; camera.right=hW; camera.top=hH; camera.bottom=-hH;
+    camera.zoom = control.zoom;
+    camera.updateProjectionMatrix();
+  }
+  function placeCamera(){
+    const e = CFG.isoElev, a = control.az, D = control.dist;
+    camera.position.set(
+      control.target.x + Math.cos(e)*Math.cos(a)*D,
+      control.target.y + Math.sin(e)*D,
+      control.target.z + Math.cos(e)*Math.sin(a)*D
+    );
+    camera.up.set(0,1,0);
+    camera.lookAt(control.target);
+  }
+
+  /* --------------------------------------------------------------- controls */
+  const dom = renderer.domElement;
+  let dragging=false, moved=false, lastX=0, lastY=0, downX=0, downY=0;
+  const pointer = { cx:0, cy:0, inside:false, dirty:false };
+
+  dom.addEventListener("pointerdown", e=>{
+    if(e.button!==0 && e.button!==2) return;
+    dragging=true; moved=false; lastX=downX=e.clientX; lastY=downY=e.clientY;
+    dom.setPointerCapture(e.pointerId);
+  });
+  window.addEventListener("pointermove", e=>{
+    pointer.cx=e.clientX; pointer.cy=e.clientY; pointer.dirty=true;
+    if(!dragging) return;
+    const dx=e.clientX-lastX, dy=e.clientY-lastY;
+    lastX=e.clientX; lastY=e.clientY;
+    if(Math.abs(e.clientX-downX)+Math.abs(e.clientY-downY) > 4) moved=true;
+    const worldPerPx = (2*control.baseHalf/control.zoom)/window.innerHeight;
+    const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld,0); right.y=0; right.normalize();
+    const fwd = new THREE.Vector3(); camera.getWorldDirection(fwd); fwd.y=0; fwd.normalize();
+    control.target.addScaledVector(right, -dx*worldPerPx);
+    control.target.addScaledVector(fwd,   dy*worldPerPx);
+  });
+  window.addEventListener("pointerup", e=>{
+    if(!dragging) return;
+    dragging=false;
+    try{ dom.releasePointerCapture(e.pointerId);}catch(_){}
+    if(!moved) handleClick();
+  });
+  dom.addEventListener("pointerleave", ()=>{ pointer.inside=false; });
+  dom.addEventListener("pointerenter", ()=>{ pointer.inside=true; });
+  dom.addEventListener("contextmenu", e=>e.preventDefault());
+  dom.addEventListener("wheel", e=>{
+    e.preventDefault();
+    control.zoom *= Math.exp(-e.deltaY*0.0016);
+    control.zoom = Math.min(60, Math.max(0.12, control.zoom));
+    updateFrustum();
+  }, {passive:false});
+
+  document.getElementById("rotL").onclick = ()=>{ control.azTarget += Math.PI/2; };
+  document.getElementById("rotR").onclick = ()=>{ control.azTarget -= Math.PI/2; };
+  document.getElementById("resetBtn").onclick = ()=>{ fitCamera(true); };
+
+  const kSlider = document.getElementById("kSlider");
+  kSlider.addEventListener("input", ()=>{
+    const nk = parseInt(kSlider.value,10);
+    document.getElementById("kBadge").textContent = "k="+nk;
+    buildCity(nk);
+    fitCamera(false);
+  });
+
+  document.getElementById("colorSeg").addEventListener("click", e=>{
+    const b = e.target.closest("button"); if(!b) return;
+    colorMode = b.dataset.mode;
+    document.querySelectorAll("#colorSeg button").forEach(x=>x.classList.toggle("on", x===b));
+    recolor(); updateLegend();
+    if(selected) renderCard(selected, true);
+  });
+
+  const scanBtn = document.getElementById("scanBtn");
+  scanBtn.onclick = ()=>{
+    const sl = document.getElementById("scanlines");
+    sl.classList.toggle("off");
+    scanBtn.textContent = sl.classList.contains("off") ? "CRT: off" : "CRT: on";
+  };
+
+  /* ---------------------------------------------------- hover + selection */
+  const hoverEl = document.getElementById("hover");
+  let hoverCell = null;    // currently under pointer
+  let selected = null;     // pinned cell
+  const fmtInt = n => Math.round(n).toLocaleString("en-US");
+  const fmtEth = n => n>=1e6 ? (n/1e6).toFixed(2)+"M"
+                    : n>=1e3 ? Math.round(n).toLocaleString("en-US")
+                    : n.toFixed(2);
+  const abbr = a => a.slice(0,6)+"…"+a.slice(-4);
+  const toHexPrefix = (v)=> "0x"+v.toString(16);
+
+  function doPick(){
+    if(!records.length) return null;
+    const rect = dom.getBoundingClientRect();
+    ndc.x = ((pointer.cx-rect.left)/rect.width)*2-1;
+    ndc.y = -((pointer.cy-rect.top)/rect.height)*2+1;
+    raycaster.setFromCamera(ndc, camera);
+    const hits = raycaster.intersectObject(buildings, false);
+    if(hits.length && hits[0].instanceId!=null){
+      const id = hits[0].instanceId;
+      if(id < cells.length) return cells[id];
+    }
+    return null;
+  }
+
+  function moveHighlight(cell){
+    const p = worldPos(cell.cx, cell.cz);
+    highlight.position.set(p.x, cell.height/2, p.z);
+    highlight.scale.set(CFG.footprint*1.04, cell.height*1.02, CFG.footprint*1.04);
+    highlight.visible = true;
+  }
+
+  function renderCard(cell, keepPinned){
+    const rep = records[cell.repIdx];
+    const cat = CAT[rep.category] || CAT.personal;
+    const isC = rep.type==="contract";
+    const pinned = keepPinned || (selected===cell);
+    const badge = `<span class="badge" style="border:1px solid ${cat.css};color:${cat.css};background:${cat.css}18">${cat.label}</span>`;
+    const merged = cell.idx.length>1 ? `<div class="merged">This tile packs <b>${cell.idx.length}</b> addresses at k=${k}. Showing the largest by balance. Tile totals: ${fmtInt(cell.sumTx)} tx · ${fmtEth(cell.sumBal)} ETH.<br>Raise resolution toward k=${uniqueK} to separate them.</div>` : "";
+    const pinbar = pinned
+      ? `<div class="pinbar"><button class="copy" data-copy="${rep.address}">Copy address</button><span class="pin-x" data-unpin="1">✕</span></div>`
+      : `<div class="addr"><b>${abbr(rep.address)}</b> · full: ${rep.address}</div>`;
+    hoverEl.innerHTML =
+      `<div class="htop"><span class="title">${rep.label ? rep.label : (isC?"Contract":"Personal wallet")}</span>${badge}</div>
+       <div class="rows">
+         <span class="rk">Type</span><span class="rv">${isC?"Contract":"Personal (EOA)"}</span>
+         <span class="rk">Balance</span><span class="rv big">${fmtEth(rep.balance)} ETH</span>
+         <span class="rk">Transactions</span><span class="rv">${fmtInt(rep.txCount)}</span>
+         <span class="rk">Tile</span><span class="rv">(${cell.cx}, ${cell.cz})</span>
+         <span class="rk">x-prefix</span><span class="rv">${toHexPrefix(cell.cx)}</span>
+         <span class="rk">y-prefix</span><span class="rv">${toHexPrefix(cell.cz)}</span>
+       </div>
+       ${merged}${pinbar}`;
+    hoverEl.classList.toggle("pinned", !!pinned);
+    hoverEl.classList.add("show");
+  }
+
+  function positionCard(){
+    const pad=14, w=hoverEl.offsetWidth||250, h=hoverEl.offsetHeight||160;
+    let x=pointer.cx+18, y=pointer.cy+18;
+    if(x+w+pad>window.innerWidth) x=pointer.cx-w-18;
+    if(y+h+pad>window.innerHeight) y=window.innerHeight-h-pad;
+    if(y<pad) y=pad; if(x<pad) x=pad;
+    hoverEl.style.left=x+"px"; hoverEl.style.top=y+"px";
+  }
+
+  function handleClick(){
+    const cell = doPick();
+    if(cell){
+      selected = cell; hoverCell = cell;
+      moveHighlight(cell); renderCard(cell, true); positionCard();
+    } else {
+      clearSelection();
+    }
+  }
+  function clearSelection(){
+    selected=null; hoverCell=null; highlight.visible=false;
+    hoverEl.classList.remove("show","pinned");
+  }
+
+  hoverEl.addEventListener("click", e=>{
+    if(e.target.dataset.unpin){ clearSelection(); return; }
+    const addr = e.target.dataset.copy;
+    if(addr){
+      const done = ()=>{ e.target.textContent="Copied"; setTimeout(()=>{ if(e.target) e.target.textContent="Copy address"; },1200); };
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(addr).then(done).catch(()=>fallbackCopy(addr,done));
+      } else fallbackCopy(addr,done);
+    }
+  });
+  function fallbackCopy(text,cb){
+    const ta=document.createElement("textarea"); ta.value=text; ta.style.position="fixed"; ta.style.opacity="0";
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand("copy"); cb&&cb(); }catch(_){}
+    document.body.removeChild(ta);
+  }
+
+  /* ------------------------------------------------------------- stats UI */
+  function fmtCells(n){
+    if(n>=1e9) return (n/1e9).toFixed(1)+"B";
+    if(n>=1e6) return (n/1e6).toFixed(1)+"M";
+    return n.toLocaleString("en-US");
+  }
+  function updateStats(){
+    let contracts=0, tx=0, bal=0;
+    for(const r of records){ if(r.type==="contract")contracts++; tx+=r.txCount; bal+=r.balance; }
+    const grid = document.getElementById("statGrid");
+    grid.innerHTML =
+      `<span class="k">Addresses</span><span class="v"><b>${fmtInt(records.length)}</b></span>
+       <span class="k">Contracts</span><span class="v">${fmtInt(contracts)}</span>
+       <span class="k">Personal (EOA)</span><span class="v">${fmtInt(records.length-contracts)}</span>
+       <span class="k">Buildings shown</span><span class="v">${fmtInt(cells.length)}</span>
+       <span class="k">Total balance</span><span class="v">${fmtEth(bal)} ETH</span>
+       <span class="k">Total tx</span><span class="v">${fmtInt(tx)}</span>`;
+    document.getElementById("uniqLine").innerHTML =
+      `Uniqueness resolution <b>k=${uniqueK}</b> → ${fmtInt(Math.pow(2,uniqueK))}² grid, one address per tile.<br>
+       Per-axis unique prefix: x=${xBits} bits, y=${yBits} bits.`;
+  }
+  function updateResMeta(){
+    const total = Math.pow(4,k);
+    const fill = (cells.length/total*100);
+    document.getElementById("resMeta").textContent =
+      `${fmtInt(Math.pow(2,k))} × ${fmtInt(Math.pow(2,k))} tiles · ${fmtCells(total)} cells · ${fill<0.1?fill.toFixed(2):fill.toFixed(1)}% filled`;
+  }
+  function updateLegend(){
+    const cap = document.getElementById("legendCap");
+    const body = document.getElementById("legendBody");
+    if(colorMode==="category"){
+      cap.textContent="Category";
+      body.innerHTML = Object.keys(CAT).map(k2=>{
+        const c=CAT[k2];
+        return `<div class="leg-item"><span class="sw" style="background:${c.css};color:${c.css}"></span>${c.label}</div>`;
+      }).join("");
+    } else if(colorMode==="type"){
+      cap.textContent="Type";
+      body.innerHTML =
+        `<div class="leg-item"><span class="sw" style="background:#00e5ff;color:#00e5ff"></span>Contract</div>
+         <div class="leg-item"><span class="sw" style="background:#ff2d95;color:#ff2d95"></span>Personal (EOA)</div>`;
+    } else {
+      cap.textContent="Balance";
+      body.innerHTML =
+        `<div class="grad"></div>
+         <div class="grad-lbl"><span>lower</span><span>higher</span></div>
+         <div class="leg-item" style="color:var(--ink-dim);font-size:10.5px">Height still encodes transactions</div>`;
+    }
+  }
+
+  /* ------------------------------------------------------------- data load */
+  function ingest(recs, synthetic){
+    records = recs;
+    dataSynthetic = !!synthetic;
+    uniqueK = computeUniqueK(records);
+    xBits = axisUniqueBits(records,"x");
+    yBits = axisUniqueBits(records,"y");
+    kMin = CFG.kMinFloor;
+    kMax = Math.max(kMin+1, Math.min(uniqueK, 20));
+    balLogMin = Infinity; balLogMax = -Infinity;
+    for(const r of records){ const L=Math.log10(1+r.balance);
+      if(L<balLogMin)balLogMin=L; if(L>balLogMax)balLogMax=L; }
+    // default k: first resolution at or below 50% fill (a dense but legible city)
+    let defK = kMax;
+    for(let kk=kMin; kk<=kMax; kk++){ if(occupiedAt(records,kk)/Math.pow(4,kk) <= 0.5){ defK=kk; break; } }
+    defK = Math.min(kMax, Math.max(kMin, defK));
+    k = defK;
+    kSlider.min=kMin; kSlider.max=kMax; kSlider.value=k;
+    document.getElementById("kBadge").textContent="k="+k;
+    const tag = document.getElementById("srcTag");
+    tag.textContent = synthetic ? "Synthetic dataset" : "Imported dataset";
+    tag.classList.toggle("live", !synthetic);
+    buildCity(k);
+    fitCamera(true);
+    updateLegend();
+  }
+
+  function loadRecords(arr){
+    // Expected: [{ address, type:"contract"|"eoa", balance:<ETH>, txCount:<int>, label?, category? }, ...]
+    const out=[];
+    for(const o of arr){
+      if(!o || !o.address) continue;
+      const raw = String(o.address).trim();
+      if(!/^(0x)?[0-9a-fA-F]{40}$/.test(raw)) continue;
+      let type = String(o.type||"").toLowerCase();
+      type = (type.includes("contract")) ? "contract" : "eoa";
+      const balance = Number(o.balance)||0;
+      const txCount = Math.max(0, Math.round(Number(o.txCount ?? o.txcount ?? o.transactions ?? 0)))||0;
+      let cat = o.category ? String(o.category).toLowerCase() : null;
+      if(cat && !CAT[cat]) cat = null;
+      out.push(makeRecord(String(o.address), type, balance, txCount, o.label||null, cat));
+    }
+    if(!out.length){ flashSplash("No valid records found in file"); return; }
+    ingest(out, false);
+  }
+
+  document.getElementById("loadBtn").onclick = ()=> document.getElementById("fileIn").click();
+  document.getElementById("fileIn").addEventListener("change", e=>{
+    const f = e.target.files[0]; if(!f) return;
+    const rd = new FileReader();
+    rd.onload = ()=>{ try{ const j=JSON.parse(rd.result);
+      loadRecords(Array.isArray(j)?j:(j.records||j.data||[])); }
+      catch(err){ flashSplash("Couldn't parse JSON"); } };
+    rd.readAsText(f);
+    e.target.value="";
+  });
+  // drag & drop
+  const dropEl = document.getElementById("drop");
+  window.addEventListener("dragover", e=>{ e.preventDefault(); dropEl.classList.add("on"); });
+  window.addEventListener("dragleave", e=>{ if(e.clientX===0&&e.clientY===0) dropEl.classList.remove("on"); });
+  window.addEventListener("drop", e=>{
+    e.preventDefault(); dropEl.classList.remove("on");
+    const f = e.dataTransfer.files[0]; if(!f) return;
+    const rd=new FileReader();
+    rd.onload=()=>{ try{ const j=JSON.parse(rd.result);
+      loadRecords(Array.isArray(j)?j:(j.records||j.data||[])); }
+      catch(err){ flashSplash("Couldn't parse JSON"); } };
+    rd.readAsText(f);
+  });
+
+  function flashSplash(msg){
+    const s=document.getElementById("splash"); const sub=document.getElementById("splashSub");
+    s.classList.remove("gone"); sub.textContent=msg;
+    setTimeout(()=>s.classList.add("gone"), 1400);
+  }
+
+  /* ------------------------------------------------------------- resize */
+  window.addEventListener("resize", ()=>{
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    updateFrustum();
+  });
+
+  /* ------------------------------------------------------------- loop */
+  let hintFaded=false, t0=performance.now();
+  function animate(){
+    requestAnimationFrame(animate);
+    // smooth rotation
+    const da = control.azTarget - control.az;
+    if(Math.abs(da) > 1e-4){ control.az += prefersReduced ? da : da*0.16; }
+    else control.az = control.azTarget;
+    placeCamera();
+
+    // hover picking (throttled to frame rate via dirty flag)
+    if(pointer.dirty && !dragging){
+      pointer.dirty=false;
+      if(pointer.inside && !selected){
+        const cell = doPick();
+        if(cell){ if(cell!==hoverCell){ hoverCell=cell; renderCard(cell,false); } moveHighlight(cell); }
+        else { hoverCell=null; highlight.visible=false; hoverEl.classList.remove("show"); }
+      } else if(!pointer.inside && !selected){
+        highlight.visible=false; hoverEl.classList.remove("show");
+      }
+    }
+    if(hoverEl.classList.contains("show") && !selected) positionCard();
+
+    renderer.render(scene, camera);
+
+    if(!hintFaded && performance.now()-t0>6500){
+      hintFaded=true; const h=document.getElementById("hint"); if(h) h.style.opacity="0";
+    }
+  }
+
+  /* ------------------------------------------------------------- init */
+  function init(){
+    ingest(generateData(), true);
+    animate();
+    // reveal
+    requestAnimationFrame(()=> setTimeout(()=>{
+      document.getElementById("splash").classList.add("gone");
+    }, 120));
+  }
+  // small delay so the splash paints before the (synchronous) data gen
+  setTimeout(init, 30);
+
+})();
+</script>
+</body>
+</html>
